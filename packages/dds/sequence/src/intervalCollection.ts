@@ -8,6 +8,9 @@
 import { EventEmitter } from "events";
 import * as MergeTree from "@fluidframework/merge-tree";
 import { ISequencedDocumentMessage } from "@fluidframework/protocol-definitions";
+import { v4 as uuid } from "uuid";
+
+const reservedIntervalIdKey = "intervalId";
 
 import { IValueFactory, IValueOpEmitter, IValueOperation, IValueType } from "./mapKernelInterfaces";
 
@@ -41,6 +44,10 @@ export class Interval implements ISerializableInterval {
         if (props) {
             this.addProperties(props);
         }
+    }
+
+    public getIntervalId(): string | undefined {
+        return this.properties?.[reservedIntervalIdKey]?.toString() as string | undefined;
     }
 
     public getAdditionalPropertySets() {
@@ -149,7 +156,21 @@ export class SequenceInterval implements ISerializableInterval {
     public compare(b: SequenceInterval) {
         const startResult = this.compareStart(b);
         if (startResult === 0) {
-            return this.compareEnd(b);
+            const endResult = this.compareEnd(b);
+            if (endResult === 0) {
+                const thisId = this.getIntervalId();
+                if (thisId) {
+                    const bId = b.getIntervalId();
+                    if (bId) {
+                        return thisId > bId ? 1 : thisId < bId ? -1 : 0;
+                    }
+                    return 0;
+                }
+                return 0;
+            }
+            else {
+                return endResult;
+            }
         } else {
             return startResult;
         }
@@ -170,6 +191,10 @@ export class SequenceInterval implements ISerializableInterval {
             this.checkOverlaps(b, result);
         }
         return result;
+    }
+
+    public getIntervalId(): string | undefined {
+        return this.properties?.[reservedIntervalIdKey]?.toString() as string | undefined;
     }
 
     public union(b: SequenceInterval) {
@@ -309,6 +334,10 @@ export class LocalIntervalCollection<TInterval extends ISerializableInterval> {
         this.intervalTree.map(fn);
     }
 
+    public mapUntil(fn: (interval: TInterval) => boolean) {
+        this.intervalTree.mapUntil(fn);
+    }
+
     public gatherIterationResults(
         results: TInterval[],
         iteratesForward: boolean,
@@ -406,6 +435,12 @@ export class LocalIntervalCollection<TInterval extends ISerializableInterval> {
         }
     }
 
+    public findInterval(start: number, end: number) {
+        const transientInterval: TInterval = this.helpers.create(
+            "transient", start, end, this.client, MergeTree.IntervalType.Transient);
+        return this.intervalTree.get(transientInterval);
+    }
+
     public previousInterval(pos: number) {
         const transientInterval = this.helpers.create(
             "transient", pos, pos, this.client, MergeTree.IntervalType.Transient);
@@ -432,7 +467,12 @@ export class LocalIntervalCollection<TInterval extends ISerializableInterval> {
         return transientInterval;
     }
 
-    public createInterval(start: number, end: number, intervalType: MergeTree.IntervalType) {
+    public removeExistingInterval(interval: TInterval) {
+        this.intervalTree.removeExisting(interval);
+        this.endIntervalTree.remove(interval);
+    }
+
+    public createInterval(start: number, end: number, intervalType: MergeTree.IntervalType): TInterval {
         return this.helpers.create(this.label, start, end, this.client, intervalType);
     }
 
@@ -441,17 +481,34 @@ export class LocalIntervalCollection<TInterval extends ISerializableInterval> {
         start: number,
         end: number,
         intervalType: MergeTree.IntervalType,
-        props?: MergeTree.PropertySet) {
-        const interval = this.createInterval(start, end, intervalType);
+        props: MergeTree.PropertySet,
+        local: boolean = true,
+    ) {
+        const interval: TInterval = this.createInterval(start, end, intervalType);
         if (interval) {
             interval.addProperties(props);
             if (this.label && (this.label.length > 0)) {
                 interval.properties[MergeTree.reservedRangeLabelsKey] = [this.label];
             }
+            if (local) {
+                interval.properties[reservedIntervalIdKey] = uuid();
+            }
             this.intervalTree.put(interval, this.conflictResolver);
             this.endIntervalTree.put(interval, interval, this.endConflictResolver);
         }
         return interval;
+    }
+
+    public getIntervalById(id) {
+        let result: TInterval | undefined;
+        this.mapUntil((interval: TInterval) => {
+            if (interval.properties?.[reservedIntervalIdKey] === id) {
+                result = interval;
+                return false;
+            }
+            return true;
+        });
+        return result;
     }
 
     public serialize() {
@@ -607,6 +664,204 @@ export class IntervalCollectionValueType
 }
 
 export type DeserializeCallback = (properties: MergeTree.PropertySet) => void;
+
+export class IntervalCollectionView<TInterval extends ISerializableInterval> extends EventEmitter {
+    private readonly localCollection: LocalIntervalCollection<TInterval>;
+    private onDeserialize: DeserializeCallback;
+
+    constructor(
+        private readonly client: MergeTree.Client,
+        savedSerializedIntervals: ISerializedInterval[],
+        label: string,
+        helpers: IIntervalHelpers<TInterval>,
+        private readonly emitter: IValueOpEmitter) {
+        super();
+
+        // Instantiate the local interval collection based on the saved intervals
+        this.localCollection = new LocalIntervalCollection<TInterval>(client, label, helpers);
+        if (savedSerializedIntervals) {
+            for (const serializedInterval of savedSerializedIntervals) {
+                this.localCollection.addInterval(
+                    serializedInterval.start,
+                    serializedInterval.end,
+                    serializedInterval.intervalType,
+                    serializedInterval.properties,
+                    false);
+            }
+        }
+    }
+
+    public attachDeserializer(onDeserialize: DeserializeCallback): void {
+        this.attachDeserializerCore(onDeserialize);
+    }
+
+    public addConflictResolver(conflictResolver: MergeTree.IntervalConflictResolver<TInterval>): void {
+        this.localCollection.addConflictResolver(conflictResolver);
+    }
+
+    public findOverlappingIntervals(startPosition: number, endPosition: number): TInterval[] {
+        return this.localCollection.findOverlappingIntervals(startPosition, endPosition);
+    }
+
+    public map(fn: (interval: TInterval) => void) {
+        this.localCollection.map(fn);
+    }
+
+    public gatherIterationResults(
+        results: TInterval[],
+        iteratesForward: boolean,
+        start?: number,
+        end?: number) {
+        this.localCollection.gatherIterationResults(results, iteratesForward, start, end);
+    }
+
+    public previousInterval(pos: number): TInterval {
+        return this.localCollection.previousInterval(pos);
+    }
+
+    public nextInterval(pos: number): TInterval {
+        return this.localCollection.nextInterval(pos);
+    }
+
+    public on(
+        event: "addInterval" | "deleteInterval",
+        listener: (interval: ISerializedInterval, local: boolean, op: ISequencedDocumentMessage) => void): this {
+        return super.on(event, listener);
+    }
+
+    public add(
+        start: number,
+        end: number,
+        intervalType: MergeTree.IntervalType,
+        props?: MergeTree.PropertySet,
+    ) {
+        const interval: TInterval = this.localCollection.addInterval(start, end, intervalType, props, true);
+
+        if (interval) {
+            const serializedInterval = {
+                end,
+                intervalType,
+                properties: interval.properties,
+                sequenceNumber: this.client?.getCurrentSeq() ?? 0,
+                start,
+            };
+            // Local ops get submitted to the server. Remote ops have the deserializer run.
+            this.emitter.emit("add", undefined, serializedInterval);
+        }
+
+        this.emit("addInterval", interval, true, undefined);
+
+        return interval;
+    }
+
+    public delete(
+        start: number,
+        end: number,
+        local: boolean = true,
+        op?: ISequencedDocumentMessage) {
+        for (let interval: TInterval | undefined = this.localCollection.findInterval(start, end);
+                interval;
+                interval = this.localCollection.findInterval(start, end)) {
+            this.deleteExistingInterval(interval, local, op);
+        }
+    }
+
+    // TODO: error cases
+    public addInternal(
+        serializedInterval: ISerializedInterval, local: boolean, op: ISequencedDocumentMessage): TInterval {
+        const interval: TInterval = this.localCollection.addInterval(
+            serializedInterval.start,
+            serializedInterval.end,
+            serializedInterval.intervalType,
+            serializedInterval.properties,
+            false);
+
+        if (interval) {
+            // Local ops get submitted to the server. Remote ops have the deserializer run.
+            if (local) {
+                // Review: Is this case possible?
+                this.emitter.emit("delete", undefined, serializedInterval);
+            } else {
+                if (this.onDeserialize) {
+                    this.onDeserialize(interval);
+                }
+            }
+        }
+
+        this.emit("addInterval", interval, local, op);
+
+        return interval;
+    }
+
+    private deleteExistingInterval(
+        interval: TInterval,
+        local: boolean = true,
+        op?: ISequencedDocumentMessage,
+    ) {
+        // The given interval is known to exist in the collection.
+        this.localCollection.removeExistingInterval(interval);
+        if (interval) {
+            // Local ops get submitted to the server. Remote ops have the deserializer run.
+            if (local) {
+                this.emitter.emit("delete", undefined, interval.serialize(this.client));
+            } else {
+                if (this.onDeserialize) {
+                    this.onDeserialize(interval);
+                }
+            }
+        }
+        this.emit("deleteInterval", interval, local, op);
+   }
+
+    public deleteInterval(
+        serializedInterval: ISerializedInterval, local: boolean, op: ISequencedDocumentMessage) {
+        const id = serializedInterval.properties?.[reservedIntervalIdKey];
+        if (id === undefined) {
+            // Delete all (start, end)
+            this.delete(serializedInterval.start, serializedInterval.end, local, op);
+        }
+        else {
+            // Delete the interval with the given ID
+            this.deleteIntervalById(id, local, op);
+        }
+    }
+
+    public getIntervalById(id) {
+        return this.localCollection.getIntervalById(id);
+    }
+
+    public deleteIntervalById(
+        id,
+        local: boolean = true,
+        op?: ISequencedDocumentMessage,
+    ) {
+        const interval = this.localCollection.getIntervalById(id);
+        if (interval) {
+            this.deleteExistingInterval(interval, local, op);
+        }
+        return interval;
+    }
+
+    public serializeInternal() {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-return
+        return this.localCollection.serialize();
+    }
+
+    private attachDeserializerCore(onDeserialize?: DeserializeCallback): void {
+        // If no deserializer is specified can skip all processing work
+        if (!onDeserialize) {
+            return;
+        }
+
+        // Start by storing the callbacks so that any subsequent modifications make use of them
+        this.onDeserialize = onDeserialize;
+
+        // Trigger the async prepare work across all values in the collection
+        this.localCollection.map((interval) => {
+            this.onDeserialize(interval);
+        });
+    }
+}
 
 export class IntervalCollectionIterator<TInterval extends ISerializableInterval> {
     private readonly results: TInterval[];
@@ -872,25 +1127,15 @@ export class IntervalCollection<TInterval extends ISerializableInterval> extends
         this.localCollection.gatherIterationResults(results, iteratesForward, start, end);
     }
 
-    public findOverlappingIntervals(startPosition: number, endPosition: number): TInterval[] {
-        return this.localCollection.findOverlappingIntervals(startPosition, endPosition);
+    public getIntervalById(id) {
+        if (this.view) {
+            return this.view.getIntervalById(id);
+        }
     }
 
-    public map(fn: (interval: TInterval) => void) {
-        this.localCollection.map(fn);
-    }
-
-    public previousInterval(pos: number): TInterval {
-        return this.localCollection.previousInterval(pos);
-    }
-
-    public nextInterval(pos: number): TInterval {
-        return this.localCollection.nextInterval(pos);
-    }
-
-    public on(
-        event: "addInterval" | "deleteInterval",
-        listener: (interval: ISerializedInterval, local: boolean, op: ISequencedDocumentMessage) => void): this {
-        return super.on(event, listener);
+    public removeIntervalById(id) {
+        if (this.view) {
+            return this.view.deleteIntervalById(id);
+        }
     }
 }
