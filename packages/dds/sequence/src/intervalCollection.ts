@@ -674,196 +674,6 @@ export class IntervalCollectionValueType
 
 export type DeserializeCallback = (properties: MergeTree.PropertySet) => void;
 
-export class IntervalCollectionView<TInterval extends ISerializableInterval> extends EventEmitter {
-    private readonly localCollection: LocalIntervalCollection<TInterval>;
-    private onDeserialize: DeserializeCallback;
-
-    constructor(
-        private readonly client: MergeTree.Client,
-        savedSerializedIntervals: ISerializedInterval[],
-        label: string,
-        helpers: IIntervalHelpers<TInterval>,
-        private readonly emitter: IValueOpEmitter) {
-        super();
-
-        // Instantiate the local interval collection based on the saved intervals
-        this.localCollection = new LocalIntervalCollection<TInterval>(client, label, helpers);
-        if (savedSerializedIntervals) {
-            for (const serializedInterval of savedSerializedIntervals) {
-                this.localCollection.ensureSerializedId(serializedInterval);
-                this.localCollection.addInterval(
-                    serializedInterval.start,
-                    serializedInterval.end,
-                    serializedInterval.intervalType,
-                    serializedInterval.properties);
-            }
-        }
-    }
-
-    public attachDeserializer(onDeserialize: DeserializeCallback): void {
-        this.attachDeserializerCore(onDeserialize);
-    }
-
-    public addConflictResolver(conflictResolver: MergeTree.IntervalConflictResolver<TInterval>): void {
-        this.localCollection.addConflictResolver(conflictResolver);
-    }
-
-    public findOverlappingIntervals(startPosition: number, endPosition: number): TInterval[] {
-        return this.localCollection.findOverlappingIntervals(startPosition, endPosition);
-    }
-
-    public map(fn: (interval: TInterval) => void) {
-        this.localCollection.map(fn);
-    }
-
-    public gatherIterationResults(
-        results: TInterval[],
-        iteratesForward: boolean,
-        start?: number,
-        end?: number) {
-        this.localCollection.gatherIterationResults(results, iteratesForward, start, end);
-    }
-
-    public getIntervalById(id) {
-        return this.localCollection.getIntervalById(id);
-    }
-
-    public previousInterval(pos: number): TInterval {
-        return this.localCollection.previousInterval(pos);
-    }
-
-    public nextInterval(pos: number): TInterval {
-        return this.localCollection.nextInterval(pos);
-    }
-
-    public on(
-        event: "addInterval" | "deleteInterval",
-        listener: (interval: ISerializedInterval, local: boolean, op: ISequencedDocumentMessage) => void): this {
-        return super.on(event, listener);
-    }
-
-    public add(
-        start: number,
-        end: number,
-        intervalType: MergeTree.IntervalType,
-        props?: MergeTree.PropertySet,
-    ) {
-        const interval: TInterval = this.localCollection.addInterval(start, end, intervalType, props);
-
-        if (interval) {
-            const serializedInterval = {
-                end,
-                intervalType,
-                properties: interval.properties,
-                sequenceNumber: this.client?.getCurrentSeq() ?? 0,
-                start,
-            };
-            // Local ops get submitted to the server. Remote ops have the deserializer run.
-            this.emitter.emit("add", undefined, serializedInterval);
-        }
-
-        this.emit("addInterval", interval, true, undefined);
-
-        return interval;
-    }
-
-    // TODO: error cases
-    public addInternal(
-        serializedInterval: ISerializedInterval, local: boolean, op: ISequencedDocumentMessage): TInterval {
-        this.localCollection.ensureSerializedId(serializedInterval);
-
-        const interval: TInterval = this.localCollection.addInterval(
-            serializedInterval.start,
-            serializedInterval.end,
-            serializedInterval.intervalType,
-            serializedInterval.properties);
-
-        if (interval) {
-            // Local ops get submitted to the server. Remote ops have the deserializer run.
-            if (local) {
-                // Review: Is this case possible?
-                this.emitter.emit("add", undefined, serializedInterval);
-            } else {
-                if (this.onDeserialize) {
-                    this.onDeserialize(interval);
-                }
-            }
-        }
-
-        this.emit("addInterval", interval, local, op);
-
-        return interval;
-    }
-
-    /**
-     * @deprecated - delete(start,end) will be removed in future.  Please use deleteIntervalById instead.
-     */
-    public delete(start: number, end: number) {
-        return this.deleteIntervalById(this.localCollection.createLegacyId(start, end));
-    }
-
-    public deleteInterval(
-        serializedInterval: ISerializedInterval, local: boolean, op: ISequencedDocumentMessage) {
-        // If the op contains an interval without an ID, create a non-unique ID for it.
-        // This is the ID that was given to the interval if we were asked to add it.
-        const id =
-            serializedInterval.properties?.[reservedIntervalIdKey] ??
-            this.localCollection.createLegacyId(serializedInterval.start, serializedInterval.end);
-        const interval = this.localCollection.getIntervalById(id);
-        if (interval) {
-            this.deleteExistingInterval(interval, local, op);
-        }
-    }
-
-    public deleteIntervalById(id) {
-        const interval = this.localCollection.getIntervalById(id);
-        if (interval) {
-            this.deleteExistingInterval(interval, true, undefined);
-        }
-        return interval;
-    }
-
-    private deleteExistingInterval(
-        interval: TInterval,
-        local: boolean,
-        op?: ISequencedDocumentMessage,
-    ) {
-        // The given interval is known to exist in the collection.
-        this.localCollection.removeExistingInterval(interval);
-        if (interval) {
-            // Local ops get submitted to the server. Remote ops have the deserializer run.
-            if (local) {
-                this.emitter.emit("delete", undefined, interval.serialize(this.client));
-            } else {
-                if (this.onDeserialize) {
-                    this.onDeserialize(interval);
-                }
-            }
-        }
-        this.emit("deleteInterval", interval, local, op);
-    }
-
-    public serializeInternal() {
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-        return this.localCollection.serialize();
-    }
-
-    private attachDeserializerCore(onDeserialize?: DeserializeCallback): void {
-        // If no deserializer is specified can skip all processing work
-        if (!onDeserialize) {
-            return;
-        }
-
-        // Start by storing the callbacks so that any subsequent modifications make use of them
-        this.onDeserialize = onDeserialize;
-
-        // Trigger the async prepare work across all values in the collection
-        this.localCollection.map((interval) => {
-            this.onDeserialize(interval);
-        });
-    }
-}
-
 export class IntervalCollectionIterator<TInterval extends ISerializableInterval> {
     private readonly results: TInterval[];
     private index: number;
@@ -927,6 +737,7 @@ export class IntervalCollection<TInterval extends ISerializableInterval> extends
         this.localCollection = new LocalIntervalCollection<TInterval>(client, label, this.helpers);
         if (this.savedSerializedIntervals) {
             for (const serializedInterval of this.savedSerializedIntervals) {
+                this.localCollection.ensureSerializedId(serializedInterval);
                 this.localCollection.addInterval(
                     serializedInterval.start,
                     serializedInterval.end,
@@ -935,6 +746,13 @@ export class IntervalCollection<TInterval extends ISerializableInterval> extends
             }
         }
         this.savedSerializedIntervals = undefined;
+    }
+
+    public getIntervalById(id) {
+        if (!this.attached) {
+            throw new Error("Must call attch before accessing intervals");
+        }
+        return this.localCollection.getIntervalById(id);
     }
 
     public add(
@@ -947,43 +765,107 @@ export class IntervalCollection<TInterval extends ISerializableInterval> extends
             throw new Error("attach must be called prior to adding intervals");
         }
 
-        let seq = 0;
-        if (this.client) {
-            seq = this.client.getCurrentSeq();
+        const interval: TInterval = this.localCollection.addInterval(start, end, intervalType, props);
+
+        if (interval) {
+            const serializedInterval = {
+                end,
+                intervalType,
+                properties: interval.properties,
+                sequenceNumber: this.client?.getCurrentSeq() ?? 0,
+                start,
+            };
+            // Local ops get submitted to the server. Remote ops have the deserializer run.
+            this.emitter.emit("add", undefined, serializedInterval);
         }
 
-        const serializedInterval: ISerializedInterval = {
-            end,
-            intervalType,
-            properties: props,
-            sequenceNumber: seq,
-            start,
-        };
+        this.emit("addInterval", interval, true, undefined);
 
-        return this.addInternal(serializedInterval, true, undefined);
+        return interval;
     }
 
-    public delete(
-        start: number,
-        end: number,
-    ) {
-        let sequenceNumber = 0;
+    // TODO: error cases
+    public addInternal(
+        serializedInterval: ISerializedInterval, local: boolean, op: ISequencedDocumentMessage): TInterval {
+        if (!this.attached) {
+            throw new Error("attachSequence must be called");
+        }
+
+        this.localCollection.ensureSerializedId(serializedInterval);
+
+        const interval: TInterval = this.localCollection.addInterval(
+            serializedInterval.start,
+            serializedInterval.end,
+            serializedInterval.intervalType,
+            serializedInterval.properties);
+
+        if (interval) {
+            // Local ops get submitted to the server. Remote ops have the deserializer run.
+            if (local) {
+                // Review: Is this case possible?
+                this.emitter.emit("add", undefined, serializedInterval);
+            } else {
+                if (this.onDeserialize) {
+                    this.onDeserialize(interval);
+                }
+            }
+        }
+
+        this.emit("addInterval", interval, local, op);
+
+        return interval;
+    }
+
+    /**
+     * @deprecated - delete(start,end) will be removed in future.  Please use deleteIntervalById instead.
+     */
+    public delete(start: number, end: number) {
+        return this.deleteIntervalById(this.localCollection.createLegacyId(start, end));
+    }
+
+    public deleteInterval(
+        serializedInterval: ISerializedInterval, local: boolean, op: ISequencedDocumentMessage) {
         if (!this.attached) {
             throw new Error("attach must be called prior to deleting intervals");
         }
 
-        if (this.client) {
-            sequenceNumber = this.client.getCurrentSeq();
+        // If the op contains an interval without an ID, create a non-unique ID for it.
+        // This is the ID that was given to the interval if we were asked to add it.
+        const id =
+            serializedInterval.properties?.[reservedIntervalIdKey] ??
+            this.localCollection.createLegacyId(serializedInterval.start, serializedInterval.end);
+        const interval = this.localCollection.getIntervalById(id);
+        if (interval) {
+            this.deleteExistingInterval(interval, local, op);
         }
+    }
 
-        const serializedInterval: ISerializedInterval = {
-            start,
-            end,
-            sequenceNumber,
-            intervalType: MergeTree.IntervalType.Transient,
-        };
+    public deleteIntervalById(id) {
+        const interval = this.localCollection.getIntervalById(id);
+        if (interval) {
+            this.deleteExistingInterval(interval, true, undefined);
+        }
+        return interval;
+    }
 
-        this.deleteInterval(serializedInterval, true, undefined);
+    private deleteExistingInterval(
+        interval: TInterval,
+        local: boolean,
+        op?: ISequencedDocumentMessage,
+    ) {
+        // The given interval is known to exist in the collection.
+        this.localCollection.removeExistingInterval(interval);
+        if (interval) {
+            // Local ops get submitted to the server. Remote ops have the deserializer run.
+            if (local) {
+                this.emitter.emit("delete", undefined, interval.serialize(this.client));
+            } else {
+                if (this.onDeserialize) {
+                    this.onDeserialize(interval);
+                }
+            }
+        }
+        this.emit("deleteInterval", interval, local, op);
     }
 
     public addConflictResolver(conflictResolver: MergeTree.IntervalConflictResolver<TInterval>): void {
@@ -994,10 +876,6 @@ export class IntervalCollection<TInterval extends ISerializableInterval> extends
     }
 
     public attachDeserializer(onDeserialize: DeserializeCallback): void {
-        this.attachDeserializerCore(onDeserialize);
-    }
-
-    private attachDeserializerCore(onDeserialize?: DeserializeCallback): void {
         // If no deserializer is specified can skip all processing work
         if (!onDeserialize) {
             return;
@@ -1026,60 +904,6 @@ export class IntervalCollection<TInterval extends ISerializableInterval> extends
         }
 
         return this;
-    }
-
-    public addInternal(
-        serializedInterval: ISerializedInterval,
-        local: boolean,
-        op: ISequencedDocumentMessage) {
-        if (!this.attached) {
-            throw new Error("attachSequence must be called");
-        }
-
-        const interval = this.localCollection.addInterval(
-            serializedInterval.start,
-            serializedInterval.end,
-            serializedInterval.intervalType,
-            serializedInterval.properties);
-
-        if (interval) {
-            // Local ops get submitted to the server. Remote ops have the deserializer run.
-            if (local) {
-                this.emitter.emit("add", undefined, serializedInterval);
-            } else {
-                if (this.onDeserialize) {
-                    this.onDeserialize(interval);
-                }
-            }
-        }
-
-        this.emit("addInterval", interval, local, op);
-
-        return interval;
-    }
-
-    public deleteInterval(
-        serializedInterval: ISerializedInterval,
-        local: boolean,
-        op: ISequencedDocumentMessage): void {
-        if (!this.attached) {
-            throw new Error("attach must be called prior to deleting intervals");
-        }
-
-        const interval = this.localCollection.removeInterval(serializedInterval.start, serializedInterval.end);
-
-        if (interval) {
-            // Local ops get submitted to the server. Remote ops have the deserializer run.
-            if (local) {
-                this.emitter.emit("delete", undefined, serializedInterval);
-            } else {
-                if (this.onDeserialize) {
-                    this.onDeserialize(interval);
-                }
-            }
-        }
-
-        this.emit("deleteInterval", interval, local, op);
     }
 
     public serializeInternal() {
@@ -1128,15 +952,41 @@ export class IntervalCollection<TInterval extends ISerializableInterval> extends
         this.localCollection.gatherIterationResults(results, iteratesForward, start, end);
     }
 
-    public getIntervalById(id) {
-        if (this.view) {
-            return this.view.getIntervalById(id);
+    public findOverlappingIntervals(startPosition: number, endPosition: number): TInterval[] {
+        if (!this.attached) {
+            throw new Error("attachSequence must be called");
         }
+
+        return this.localCollection.findOverlappingIntervals(startPosition, endPosition);
     }
 
-    public removeIntervalById(id) {
-        if (this.view) {
-            return this.view.deleteIntervalById(id);
+    public map(fn: (interval: TInterval) => void) {
+        if (!this.attached) {
+            throw new Error("attachSequence must be called");
         }
+
+        this.localCollection.map(fn);
+    }
+
+    public previousInterval(pos: number): TInterval {
+        if (!this.attached) {
+            throw new Error("attachSequence must be called");
+        }
+
+        return this.localCollection.previousInterval(pos);
+    }
+
+    public nextInterval(pos: number): TInterval {
+        if (!this.attached) {
+            throw new Error("attachSequence must be called");
+        }
+
+        return this.localCollection.nextInterval(pos);
+    }
+
+    public on(
+        event: "addInterval" | "deleteInterval",
+        listener: (interval: ISerializedInterval, local: boolean, op: ISequencedDocumentMessage) => void): this {
+        return super.on(event, listener);
     }
 }
